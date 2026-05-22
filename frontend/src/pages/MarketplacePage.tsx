@@ -344,18 +344,23 @@ function ColumnsTab({
                       }))}
                     />
                   ) : hasTableLineage ? (
-                    // Table-level fallback graph
+                    // Table-level fallback — deduplicated by FQN, centered on the column
                     <div>
                       <p className="text-[10px] text-amber-700 bg-amber-50 border border-amber-100 px-2 py-1 rounded mb-2 inline-block">
-                        Column-level mapping unavailable — showing table-level lineage
+                        Column-level mapping unavailable — showing table-level connections
                       </p>
                       <MiniLineageGraph
-                        upstreamNodes={tableLevelUpstream.map((e) => ({
+                        upstreamNodes={[
+                          ...new Map(tableLevelUpstream.map((e) => [e.source_fqn, e])).values(),
+                        ].map((e) => ({
                           label: parseFqn(e.source_fqn),
                           sublabel: e.confidence,
                         }))}
-                        centerLabel={assetName}
-                        downstreamNodes={tableLevelDownstream.map((e) => ({
+                        centerLabel={col.name}
+                        centerSublabel={assetName}
+                        downstreamNodes={[
+                          ...new Map(tableLevelDownstream.map((e) => [e.target_fqn, e])).values(),
+                        ].map((e) => ({
                           label: parseFqn(e.target_fqn),
                           sublabel: e.confidence,
                         }))}

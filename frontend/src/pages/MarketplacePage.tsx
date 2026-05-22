@@ -172,23 +172,107 @@ function CatalogCard({ item, onClick }: { item: CatalogItem; onClick: () => void
   );
 }
 
+// ── Mini Lineage Graph (shared by Lineage tab + column expansion) ──────────
+
+interface MiniNode {
+  label: string;
+  sublabel?: string;
+}
+
+function MiniLineageGraph({
+  upstreamNodes,
+  centerLabel,
+  centerSublabel,
+  downstreamNodes,
+}: {
+  upstreamNodes: MiniNode[];
+  centerLabel: string;
+  centerSublabel?: string;
+  downstreamNodes: MiniNode[];
+}) {
+  const Arrow = () => (
+    <div className="flex items-center shrink-0">
+      <div className="w-5 border-t border-gray-300" />
+      <svg className="w-2.5 h-2.5 text-gray-300 -ml-px" viewBox="0 0 24 24" fill="currentColor">
+        <polygon points="0,0 24,12 0,24" />
+      </svg>
+    </div>
+  );
+
+  return (
+    <div className="overflow-x-auto">
+      <div className="flex items-center gap-2 py-3 min-w-max">
+        {upstreamNodes.length > 0 && (
+          <>
+            <div className="flex flex-col gap-2 items-end">
+              {upstreamNodes.map((n, i) => (
+                <div key={i} className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2 text-right min-w-[110px]">
+                  <p className="text-xs font-mono font-semibold text-gray-700 leading-snug">{n.label}</p>
+                  {n.sublabel && (
+                    <p className={`text-[10px] mt-0.5 font-medium ${n.sublabel === "HIGH" ? "text-green-500" : "text-yellow-500"}`}>
+                      {n.sublabel}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+            <Arrow />
+          </>
+        )}
+
+        <div className="bg-blue-500 rounded-lg px-4 py-2.5 text-center shrink-0 min-w-[120px]">
+          <p className="text-xs font-mono font-bold text-white leading-snug">{centerLabel}</p>
+          {centerSublabel && <p className="text-[10px] text-blue-200 mt-0.5">{centerSublabel}</p>}
+        </div>
+
+        {downstreamNodes.length > 0 && (
+          <>
+            <Arrow />
+            <div className="flex flex-col gap-2 items-start">
+              {downstreamNodes.map((n, i) => (
+                <div key={i} className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2 min-w-[110px]">
+                  <p className="text-xs font-mono font-semibold text-gray-700 leading-snug">{n.label}</p>
+                  {n.sublabel && (
+                    <p className={`text-[10px] mt-0.5 font-medium ${n.sublabel === "HIGH" ? "text-green-500" : "text-yellow-500"}`}>
+                      {n.sublabel}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Columns Tab ────────────────────────────────────────────────────────────
 
 function ColumnsTab({
   columns,
+  assetName,
   lineageEdges,
 }: {
   columns: ColumnRecord[];
+  assetName: string;
   lineageEdges: LineageEdge[];
 }) {
   const [expandedCol, setExpandedCol] = useState<string | null>(null);
 
+  // Separate table-level edges (no column info) from column-level edges
+  const tableLevelUpstream = lineageEdges.filter(
+    (e) => e.direction === "UPSTREAM" && !e.source_column && !e.target_column
+  );
+  const tableLevelDownstream = lineageEdges.filter(
+    (e) => e.direction === "DOWNSTREAM" && !e.source_column && !e.target_column
+  );
+  const hasTableLineage = tableLevelUpstream.length > 0 || tableLevelDownstream.length > 0;
+
   function getColLineage(colName: string) {
-    // UPSTREAM edge: this asset receives data → target_column is the column in this asset
     const upstream = lineageEdges.filter(
       (e) => e.direction === "UPSTREAM" && e.target_column === colName && e.source_column
     );
-    // DOWNSTREAM edge: this asset sends data → source_column is the column in this asset
     const downstream = lineageEdges.filter(
       (e) => e.direction === "DOWNSTREAM" && e.source_column === colName && e.target_column
     );
@@ -205,6 +289,7 @@ function ColumnsTab({
           const isExpanded = expandedCol === col.name;
           const { upstream, downstream } = getColLineage(col.name);
           const hasColLineage = upstream.length > 0 || downstream.length > 0;
+          const showLineageBadge = hasColLineage || hasTableLineage;
 
           return (
             <div key={col.name}>
@@ -224,7 +309,7 @@ function ColumnsTab({
                         PII
                       </span>
                     )}
-                    {hasColLineage && (
+                    {showLineageBadge && (
                       <span className="text-[10px] bg-purple-50 text-purple-500 border border-purple-100 px-1.5 py-0.5 rounded font-medium">
                         lineage
                       </span>
@@ -243,54 +328,41 @@ function ColumnsTab({
               </button>
 
               {isExpanded && (
-                <div className="ml-9 mr-3 mb-2 p-3 bg-gray-50 rounded-lg border border-gray-100 text-xs">
-                  {!hasColLineage ? (
-                    <p className="text-gray-400 italic">No column-level lineage recorded for this column.</p>
-                  ) : (
-                    <div className="space-y-3">
-                      {upstream.length > 0 && (
-                        <div>
-                          <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
-                            ← Upstream (feeds into this column)
-                          </p>
-                          <ul className="space-y-1">
-                            {upstream.map((e, i) => (
-                              <li key={i} className="flex items-center gap-2">
-                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
-                                <span className="font-mono text-gray-700">
-                                  {parseFqn(e.source_fqn)}
-                                  <span className="text-gray-400">.{e.source_column}</span>
-                                </span>
-                                <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded ${e.confidence === "HIGH" ? "bg-green-50 text-green-600" : "bg-yellow-50 text-yellow-600"}`}>
-                                  {e.confidence}
-                                </span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                      {downstream.length > 0 && (
-                        <div>
-                          <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
-                            → Downstream (this column feeds into)
-                          </p>
-                          <ul className="space-y-1">
-                            {downstream.map((e, i) => (
-                              <li key={i} className="flex items-center gap-2">
-                                <span className="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0" />
-                                <span className="font-mono text-gray-700">
-                                  {parseFqn(e.target_fqn)}
-                                  <span className="text-gray-400">.{e.target_column}</span>
-                                </span>
-                                <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded ${e.confidence === "HIGH" ? "bg-green-50 text-green-600" : "bg-yellow-50 text-yellow-600"}`}>
-                                  {e.confidence}
-                                </span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
+                <div className="ml-9 mr-3 mb-2 p-3 bg-gray-50 rounded-lg border border-gray-100">
+                  {hasColLineage ? (
+                    // Column-level lineage graph
+                    <MiniLineageGraph
+                      upstreamNodes={upstream.map((e) => ({
+                        label: `${parseFqn(e.source_fqn)}.${e.source_column}`,
+                        sublabel: e.confidence,
+                      }))}
+                      centerLabel={col.name}
+                      centerSublabel={assetName}
+                      downstreamNodes={downstream.map((e) => ({
+                        label: `${parseFqn(e.target_fqn)}.${e.target_column}`,
+                        sublabel: e.confidence,
+                      }))}
+                    />
+                  ) : hasTableLineage ? (
+                    // Table-level fallback graph
+                    <div>
+                      <p className="text-[10px] text-amber-700 bg-amber-50 border border-amber-100 px-2 py-1 rounded mb-2 inline-block">
+                        Column-level mapping unavailable — showing table-level lineage
+                      </p>
+                      <MiniLineageGraph
+                        upstreamNodes={tableLevelUpstream.map((e) => ({
+                          label: parseFqn(e.source_fqn),
+                          sublabel: e.confidence,
+                        }))}
+                        centerLabel={assetName}
+                        downstreamNodes={tableLevelDownstream.map((e) => ({
+                          label: parseFqn(e.target_fqn),
+                          sublabel: e.confidence,
+                        }))}
+                      />
                     </div>
+                  ) : (
+                    <p className="text-xs text-gray-400 italic">No lineage data available. Run Fetch Lineage first.</p>
                   )}
                 </div>
               )}
@@ -303,32 +375,6 @@ function ColumnsTab({
 }
 
 // ── Lineage Tab ────────────────────────────────────────────────────────────
-
-function LineageNode({
-  label,
-  sublabel,
-  variant,
-}: {
-  label: string;
-  sublabel?: string;
-  variant: "upstream" | "current" | "downstream";
-}) {
-  const styles = {
-    upstream: "bg-gray-50 border border-gray-200 text-gray-700",
-    current: "bg-blue-500 border border-blue-500 text-white",
-    downstream: "bg-gray-50 border border-gray-200 text-gray-700",
-  };
-  return (
-    <div className={`rounded-lg px-4 py-2.5 text-center min-w-[130px] ${styles[variant]}`}>
-      <p className="text-xs font-semibold leading-snug">{label}</p>
-      {sublabel && (
-        <p className={`text-[10px] mt-0.5 ${variant === "current" ? "text-blue-200" : "text-gray-400"}`}>
-          {sublabel}
-        </p>
-      )}
-    </div>
-  );
-}
 
 function LineageTab({
   item,
@@ -390,76 +436,38 @@ function LineageTab({
   return (
     <div>
       {hasTableLineage && (
-        <div className="flex items-start justify-center gap-6 py-6">
-          {/* Upstream column */}
-          {upstreamFqns.length > 0 && (
-            <div className="flex flex-col items-center gap-2 pt-8">
-              <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Upstream</p>
-              {upstreamFqns.map((e, i) => (
-                <LineageNode
-                  key={i}
-                  label={parseFqn(e.source_fqn)}
-                  sublabel={e.confidence}
-                  variant="upstream"
-                />
-              ))}
-            </div>
-          )}
-
-          {/* Arrow */}
-          {upstreamFqns.length > 0 && (
-            <div className="flex items-center self-center mt-8">
-              <div className="w-8 border-t-2 border-gray-300" />
-              <svg className="w-3 h-3 text-gray-300 -ml-0.5" viewBox="0 0 24 24" fill="currentColor">
-                <polygon points="0,0 24,12 0,24" />
-              </svg>
-            </div>
-          )}
-
-          {/* Current table */}
-          <div className="flex flex-col items-center self-center mt-8">
-            <LineageNode
-              label={item.asset}
-              sublabel={item.dataset_id}
-              variant="current"
-            />
+        <div>
+          <div className="flex gap-6 mb-2">
+            {upstreamFqns.length > 0 && (
+              <p className="text-[10px] text-gray-400 uppercase tracking-wider">← Upstream</p>
+            )}
+            {downstreamFqns.length > 0 && (
+              <p className="text-[10px] text-gray-400 uppercase tracking-wider ml-auto">Downstream →</p>
+            )}
           </div>
-
-          {/* Arrow */}
-          {downstreamFqns.length > 0 && (
-            <div className="flex items-center self-center mt-8">
-              <div className="w-8 border-t-2 border-gray-300" />
-              <svg className="w-3 h-3 text-gray-300 -ml-0.5" viewBox="0 0 24 24" fill="currentColor">
-                <polygon points="0,0 24,12 0,24" />
-              </svg>
-            </div>
-          )}
-
-          {/* Downstream column */}
-          {downstreamFqns.length > 0 && (
-            <div className="flex flex-col items-center gap-2 pt-8">
-              <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Downstream</p>
-              {downstreamFqns.map((e, i) => (
-                <LineageNode
-                  key={i}
-                  label={parseFqn(e.target_fqn)}
-                  sublabel={e.confidence}
-                  variant="downstream"
-                />
-              ))}
-            </div>
-          )}
+          <MiniLineageGraph
+            upstreamNodes={upstreamFqns.map((e) => ({
+              label: parseFqn(e.source_fqn),
+              sublabel: e.confidence,
+            }))}
+            centerLabel={item.asset}
+            centerSublabel={item.dataset_id}
+            downstreamNodes={downstreamFqns.map((e) => ({
+              label: parseFqn(e.target_fqn),
+              sublabel: e.confidence,
+            }))}
+          />
         </div>
       )}
 
       {colLineageCount > 0 && (
-        <p className="text-center text-xs text-gray-400 mt-2">
-          + {colLineageCount} column-level edges — click columns in the Columns tab to inspect
+        <p className="text-xs text-gray-400 mt-3 text-center">
+          + {colLineageCount} column-level edges — expand columns in the Columns tab to inspect
         </p>
       )}
 
-      <p className="text-center text-[10px] text-gray-300 mt-4">
-        — HIGH confidence &nbsp; - - - MEDIUM &nbsp; Click upstream/downstream nodes to navigate
+      <p className="text-[10px] text-gray-300 mt-4 text-center">
+        — HIGH confidence &nbsp;·&nbsp; - - - MEDIUM
       </p>
     </div>
   );
@@ -625,7 +633,7 @@ function CardDetailModal({
         {/* Tab content */}
         <div className="flex-1 overflow-y-auto p-6">
           {tab === "columns" && (
-            <ColumnsTab columns={item.columns} lineageEdges={lineageEdges} />
+            <ColumnsTab columns={item.columns} assetName={item.asset} lineageEdges={lineageEdges} />
           )}
           {tab === "lineage" && (
             <LineageTab item={item} edges={lineageEdges} loading={lineageLoading} />

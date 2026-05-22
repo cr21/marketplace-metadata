@@ -562,6 +562,179 @@ async def update_catalog(req: UpdateCatalogRequest) -> StreamingResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Marketplace init (SSE streaming)
+# ---------------------------------------------------------------------------
+
+class MarketplaceInitRequest(BaseModel):
+    project_id: str
+
+
+def _do_marketplace_init(req: MarketplaceInitRequest, emit: Callable[[dict[str, Any]], None]) -> None:
+    """Read the existing data_catalog_registry and stream init steps as SSE."""
+    import json as _json
+
+    settings = get_settings()
+
+    # Step 1 — connect
+    emit({"type": "step", "step": 1, "status": "in_progress",
+          "text": f"Connecting to BigQuery project {req.project_id}"})
+    client = get_bq_client(settings)
+    try:
+        list(client.list_datasets(project=req.project_id, max_results=1))
+    except Exception as exc:
+        raise RuntimeError(f"Cannot connect to project {req.project_id}: {exc}") from exc
+    emit({"type": "step", "step": 1, "status": "done",
+          "text": f"Connecting to BigQuery project {req.project_id}"})
+
+    # Step 2 — list datasets
+    all_datasets = list(client.list_datasets(project=req.project_id))
+    dataset_ids = [ds.dataset_id for ds in all_datasets]
+    emit({"type": "step", "step": 2, "status": "in_progress",
+          "text": f"Scanning INFORMATION_SCHEMA across {len(dataset_ids)} datasets"})
+
+    registry_dataset: str | None = None
+    for dataset_id in dataset_ids:
+        try:
+            client.get_table(f"{req.project_id}.{dataset_id}.data_catalog_registry")
+            registry_dataset = dataset_id
+            break
+        except Exception:
+            continue
+
+    emit({"type": "step", "step": 2, "status": "done",
+          "text": f"Scanning INFORMATION_SCHEMA across {len(dataset_ids)} datasets"})
+
+    if registry_dataset is None:
+        emit({"type": "error", "text": "No data_catalog_registry table found. Build a catalog first."})
+        return
+
+    # Step 3 — registry found
+    emit({"type": "step", "step": 3, "status": "done",
+          "text": f"Found data_catalog_registry in {registry_dataset} — version 1"})
+
+    # Step 4 — read rows
+    sql = f"""
+    SELECT
+        project_id, dataset_id, asset, asset_type,
+        table_metadata,
+        TO_JSON_STRING(columns) AS columns_json
+    FROM `{req.project_id}.{registry_dataset}.data_catalog_registry`
+    ORDER BY dataset_id, asset
+    """
+    rows = list(client.query(sql).result())
+
+    # Try lineage counts per asset
+    lineage_per_asset: dict[str, dict[str, int]] = {}
+    total_lineage_edges = 0
+    try:
+        lineage_sql = f"""
+        SELECT asset, direction, COUNT(*) AS cnt
+        FROM `{req.project_id}.{registry_dataset}.lineage_registry`
+        GROUP BY asset, direction
+        """
+        for lr in client.query(lineage_sql).result():
+            if lr.asset not in lineage_per_asset:
+                lineage_per_asset[lr.asset] = {"upstream": 0, "downstream": 0}
+            key = "upstream" if lr.direction == "UPSTREAM" else "downstream"
+            lineage_per_asset[lr.asset][key] = lr.cnt
+            total_lineage_edges += lr.cnt
+    except Exception:
+        pass
+
+    emit({"type": "step", "step": 4, "status": "done",
+          "text": f"{len(rows)} persisted objects · {total_lineage_edges} lineage edges loaded"})
+
+    # Build catalog payload
+    catalog_items: list[dict[str, Any]] = []
+    domains: set[str] = set()
+    datasets_seen: set[str] = set()
+
+    for row in rows:
+        try:
+            table_meta: dict[str, Any] = _json.loads(row.table_metadata) if row.table_metadata else {}
+        except Exception:
+            table_meta = {}
+
+        try:
+            columns: list[Any] = _json.loads(row.columns_json) if row.columns_json else []
+        except Exception:
+            columns = []
+
+        labels = table_meta.get("labels") or {}
+        if isinstance(labels, dict) and labels.get("domain"):
+            domains.add(labels["domain"])
+
+        datasets_seen.add(row.dataset_id)
+        lineage = lineage_per_asset.get(row.asset, {"upstream": 0, "downstream": 0})
+
+        catalog_items.append({
+            "project_id": row.project_id,
+            "dataset_id": row.dataset_id,
+            "asset": row.asset,
+            "asset_type": row.asset_type,
+            "table_metadata": table_meta,
+            "columns": columns,
+            "lineage": lineage,
+        })
+
+    modified_times = [
+        item["table_metadata"]["modified"]
+        for item in catalog_items
+        if item["table_metadata"].get("modified")
+    ]
+    last_crawled = max(modified_times) if modified_times else None
+
+    emit({
+        "type": "done",
+        "project_id": req.project_id,
+        "registry_dataset": registry_dataset,
+        "registry_path": f"{req.project_id}.{registry_dataset}.data_catalog_registry",
+        "object_count": len(catalog_items),
+        "dataset_count": len(datasets_seen),
+        "domain_count": len(domains),
+        "lineage_edge_count": total_lineage_edges,
+        "registry_version": 1,
+        "last_crawled": last_crawled,
+        "catalog": catalog_items,
+    })
+
+
+@app.post("/api/marketplace/init")
+async def marketplace_init(req: MarketplaceInitRequest) -> StreamingResponse:
+    """Stream marketplace initialisation steps as Server-Sent Events."""
+
+    async def event_stream() -> Any:
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def emit(event: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        def worker() -> None:
+            try:
+                _do_marketplace_init(req, emit)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "text": str(exc)})
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield _sse(event)
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/api/catalog/build")
 async def build_catalog(req: BuildCatalogRequest) -> StreamingResponse:
     """Stream catalog build progress as Server-Sent Events."""

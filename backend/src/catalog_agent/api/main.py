@@ -43,18 +43,19 @@ _DDL_FILE = Path(__file__).parents[4] / "infra" / "bq" / "data_catalog_registry.
 
 
 def _registry_ddl(project: str, dataset: str, table: str) -> str:
-    """Return CREATE OR REPLACE TABLE DDL targeting the given project.dataset.table.
+    """Return CREATE TABLE IF NOT EXISTS DDL targeting the given project.dataset.table.
 
     Reads the canonical schema from infra/bq/data_catalog_registry.sql, strips
     comment lines and the trailing semicolon, then rewrites the CREATE statement
-    to target the caller's destination.
+    to target the caller's destination.  Uses IF NOT EXISTS so that an existing
+    registry table (and all its rows) is never clobbered.
     """
     raw = _DDL_FILE.read_text()
     body_lines = [l for l in raw.splitlines() if not l.strip().startswith("--")]
     body = "\n".join(body_lines).strip().rstrip(";")
     return re.sub(
         r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`[^`]+`",
-        f"CREATE OR REPLACE TABLE `{project}.{dataset}.{table}`",
+        f"CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{table}`",
         body,
         flags=re.IGNORECASE,
     )

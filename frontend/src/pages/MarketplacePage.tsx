@@ -46,7 +46,41 @@ interface MarketplaceData {
   catalog: CatalogItem[];
 }
 
-// ── Init Screen ─────────────────────────────────────────────────────────────
+interface LineageEdge {
+  direction: "UPSTREAM" | "DOWNSTREAM";
+  source_fqn: string | null;
+  target_fqn: string | null;
+  source_column: string | null;
+  target_column: string | null;
+  confidence: string;
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function formatSize(bytes?: number | null): string {
+  if (!bytes) return "—";
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function parseFqn(fqn: string | null): string {
+  if (!fqn) return "Unknown";
+  // format: "bigquery:project.dataset.table" or "project.dataset.table"
+  const parts = fqn.replace(/^bigquery:/, "").split(".");
+  return parts[parts.length - 1];
+}
+
+function getDomainTag(item: CatalogItem): string {
+  const labels = item.table_metadata.labels || {};
+  const domain = labels.domain?.toUpperCase() ?? "";
+  const category = labels.category?.toUpperCase() ?? "";
+  if (domain && category) return `${domain} / ${category}`;
+  return domain;
+}
+
+// ── Init Screen ────────────────────────────────────────────────────────────
 
 function StepIcon({ status }: { status: StepState["status"] }) {
   if (status === "done") {
@@ -67,9 +101,7 @@ function StepIcon({ status }: { status: StepState["status"] }) {
       </span>
     );
   }
-  return (
-    <span className="shrink-0 w-5 h-5 rounded-full border-2 border-gray-200 flex items-center justify-center" />
-  );
+  return <span className="shrink-0 w-5 h-5 rounded-full border-2 border-gray-200" />;
 }
 
 function InitScreen({ steps }: { steps: StepState[] }) {
@@ -84,10 +116,7 @@ function InitScreen({ steps }: { steps: StepState[] }) {
         </div>
         <div className="space-y-4">
           {steps.map((step, i) => (
-            <div
-              key={i}
-              className={`flex items-center gap-3 transition-opacity ${step.status === "pending" ? "opacity-35" : "opacity-100"}`}
-            >
+            <div key={i} className={`flex items-center gap-3 transition-opacity ${step.status === "pending" ? "opacity-35" : "opacity-100"}`}>
               <StepIcon status={step.status} />
               <span className="text-sm text-gray-700">{step.text}</span>
             </div>
@@ -99,22 +128,6 @@ function InitScreen({ steps }: { steps: StepState[] }) {
 }
 
 // ── Catalog Card ───────────────────────────────────────────────────────────
-
-function formatSize(bytes?: number): string {
-  if (!bytes) return "—";
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
-
-function getDomainTag(item: CatalogItem): string {
-  const labels = item.table_metadata.labels || {};
-  const domain = labels.domain?.toUpperCase() ?? "";
-  const category = labels.category?.toUpperCase() ?? "";
-  if (domain && category) return `${domain} / ${category}`;
-  return domain;
-}
 
 function CatalogCard({ item, onClick }: { item: CatalogItem; onClick: () => void }) {
   const description = item.table_metadata.description || "No description available.";
@@ -134,18 +147,13 @@ function CatalogCard({ item, onClick }: { item: CatalogItem; onClick: () => void
           {item.asset_type}
         </span>
       </div>
-
       <h3 className="text-sm font-semibold text-gray-900 mb-1.5 group-hover:text-blue-700 transition-colors">
         {item.asset}
       </h3>
       <p className="text-xs text-gray-500 leading-relaxed mb-3 line-clamp-2">{description}</p>
-
       {domainTag && (
-        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2.5">
-          {domainTag}
-        </p>
+        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2.5">{domainTag}</p>
       )}
-
       <div className="flex items-center gap-3 text-xs text-gray-400">
         <span className="flex items-center gap-1">
           <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -156,17 +164,322 @@ function CatalogCard({ item, onClick }: { item: CatalogItem; onClick: () => void
           </svg>
           {item.columns.length}
         </span>
-        {item.lineage.upstream > 0 && (
-          <span className="text-emerald-500">+{item.lineage.upstream}</span>
-        )}
-        {item.lineage.downstream > 0 && (
-          <span className="text-blue-400">→{item.lineage.downstream}</span>
-        )}
-        {piiCount > 0 && (
-          <span className="text-orange-400 ml-auto">⚠ {piiCount} PII</span>
-        )}
+        {item.lineage.upstream > 0 && <span className="text-emerald-500">+{item.lineage.upstream}</span>}
+        {item.lineage.downstream > 0 && <span className="text-blue-400">→{item.lineage.downstream}</span>}
+        {piiCount > 0 && <span className="text-orange-400 ml-auto">⚠ {piiCount} PII</span>}
       </div>
     </button>
+  );
+}
+
+// ── Columns Tab ────────────────────────────────────────────────────────────
+
+function ColumnsTab({
+  columns,
+  lineageEdges,
+}: {
+  columns: ColumnRecord[];
+  lineageEdges: LineageEdge[];
+}) {
+  const [expandedCol, setExpandedCol] = useState<string | null>(null);
+
+  function getColLineage(colName: string) {
+    // UPSTREAM edge: this asset receives data → target_column is the column in this asset
+    const upstream = lineageEdges.filter(
+      (e) => e.direction === "UPSTREAM" && e.target_column === colName && e.source_column
+    );
+    // DOWNSTREAM edge: this asset sends data → source_column is the column in this asset
+    const downstream = lineageEdges.filter(
+      (e) => e.direction === "DOWNSTREAM" && e.source_column === colName && e.target_column
+    );
+    return { upstream, downstream };
+  }
+
+  return (
+    <div>
+      <p className="text-xs text-gray-400 uppercase tracking-wider mb-4">
+        {columns.length} columns — click to inspect
+      </p>
+      <div className="space-y-1">
+        {columns.map((col) => {
+          const isExpanded = expandedCol === col.name;
+          const { upstream, downstream } = getColLineage(col.name);
+          const hasColLineage = upstream.length > 0 || downstream.length > 0;
+
+          return (
+            <div key={col.name}>
+              <button
+                onClick={() => setExpandedCol(isExpanded ? null : col.name)}
+                className={`w-full flex items-start gap-3 p-3 rounded-lg text-left transition-colors ${
+                  isExpanded ? "bg-blue-50 border border-blue-100" : "hover:bg-gray-50"
+                }`}
+              >
+                <span className="text-gray-300 font-mono text-sm mt-0.5 shrink-0">#</span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium text-gray-900">{col.name}</span>
+                    <span className="text-xs text-gray-400 font-mono">{col.data_type}</span>
+                    {col.is_pii && (
+                      <span className="text-[10px] bg-orange-50 text-orange-500 border border-orange-200 px-1.5 py-0.5 rounded font-medium">
+                        PII
+                      </span>
+                    )}
+                    {hasColLineage && (
+                      <span className="text-[10px] bg-purple-50 text-purple-500 border border-purple-100 px-1.5 py-0.5 rounded font-medium">
+                        lineage
+                      </span>
+                    )}
+                  </div>
+                  {col.description && (
+                    <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">{col.description}</p>
+                  )}
+                </div>
+                <svg
+                  className={`w-3.5 h-3.5 text-gray-400 shrink-0 mt-1 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+                  viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+
+              {isExpanded && (
+                <div className="ml-9 mr-3 mb-2 p-3 bg-gray-50 rounded-lg border border-gray-100 text-xs">
+                  {!hasColLineage ? (
+                    <p className="text-gray-400 italic">No column-level lineage recorded for this column.</p>
+                  ) : (
+                    <div className="space-y-3">
+                      {upstream.length > 0 && (
+                        <div>
+                          <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
+                            ← Upstream (feeds into this column)
+                          </p>
+                          <ul className="space-y-1">
+                            {upstream.map((e, i) => (
+                              <li key={i} className="flex items-center gap-2">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                                <span className="font-mono text-gray-700">
+                                  {parseFqn(e.source_fqn)}
+                                  <span className="text-gray-400">.{e.source_column}</span>
+                                </span>
+                                <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded ${e.confidence === "HIGH" ? "bg-green-50 text-green-600" : "bg-yellow-50 text-yellow-600"}`}>
+                                  {e.confidence}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {downstream.length > 0 && (
+                        <div>
+                          <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
+                            → Downstream (this column feeds into)
+                          </p>
+                          <ul className="space-y-1">
+                            {downstream.map((e, i) => (
+                              <li key={i} className="flex items-center gap-2">
+                                <span className="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0" />
+                                <span className="font-mono text-gray-700">
+                                  {parseFqn(e.target_fqn)}
+                                  <span className="text-gray-400">.{e.target_column}</span>
+                                </span>
+                                <span className={`ml-auto text-[10px] px-1.5 py-0.5 rounded ${e.confidence === "HIGH" ? "bg-green-50 text-green-600" : "bg-yellow-50 text-yellow-600"}`}>
+                                  {e.confidence}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Lineage Tab ────────────────────────────────────────────────────────────
+
+function LineageNode({
+  label,
+  sublabel,
+  variant,
+}: {
+  label: string;
+  sublabel?: string;
+  variant: "upstream" | "current" | "downstream";
+}) {
+  const styles = {
+    upstream: "bg-gray-50 border border-gray-200 text-gray-700",
+    current: "bg-blue-500 border border-blue-500 text-white",
+    downstream: "bg-gray-50 border border-gray-200 text-gray-700",
+  };
+  return (
+    <div className={`rounded-lg px-4 py-2.5 text-center min-w-[130px] ${styles[variant]}`}>
+      <p className="text-xs font-semibold leading-snug">{label}</p>
+      {sublabel && (
+        <p className={`text-[10px] mt-0.5 ${variant === "current" ? "text-blue-200" : "text-gray-400"}`}>
+          {sublabel}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function LineageTab({
+  item,
+  edges,
+  loading,
+}: {
+  item: CatalogItem;
+  edges: LineageEdge[];
+  loading: boolean;
+}) {
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16 text-gray-400">
+        <svg className="w-5 h-5 animate-spin mr-2 text-blue-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
+        </svg>
+        <span className="text-sm">Loading lineage...</span>
+      </div>
+    );
+  }
+
+  // Table-level edges only (no column pair) for the graph view
+  const tableLevelEdges = edges.filter((e) => !e.source_column && !e.target_column);
+
+  const upstreamFqns = [
+    ...new Map(
+      tableLevelEdges
+        .filter((e) => e.direction === "UPSTREAM" && e.source_fqn)
+        .map((e) => [e.source_fqn, e])
+    ).values(),
+  ];
+  const downstreamFqns = [
+    ...new Map(
+      tableLevelEdges
+        .filter((e) => e.direction === "DOWNSTREAM" && e.target_fqn)
+        .map((e) => [e.target_fqn, e])
+    ).values(),
+  ];
+
+  const hasTableLineage = upstreamFqns.length > 0 || downstreamFqns.length > 0;
+  const colLineageCount = edges.filter((e) => e.source_column || e.target_column).length;
+
+  if (!hasTableLineage && colLineageCount === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 text-gray-400">
+        <svg className="w-12 h-12 mb-3 opacity-25" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <circle cx="6" cy="12" r="3" />
+          <circle cx="18" cy="6" r="3" />
+          <circle cx="18" cy="18" r="3" />
+          <line x1="9" y1="11" x2="15" y2="7" />
+          <line x1="9" y1="13" x2="15" y2="17" />
+        </svg>
+        <p className="text-sm font-medium mb-1">No lineage data available</p>
+        <p className="text-xs">Run the lineage fetcher to populate this view</p>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {hasTableLineage && (
+        <div className="flex items-start justify-center gap-6 py-6">
+          {/* Upstream column */}
+          {upstreamFqns.length > 0 && (
+            <div className="flex flex-col items-center gap-2 pt-8">
+              <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Upstream</p>
+              {upstreamFqns.map((e, i) => (
+                <LineageNode
+                  key={i}
+                  label={parseFqn(e.source_fqn)}
+                  sublabel={e.confidence}
+                  variant="upstream"
+                />
+              ))}
+            </div>
+          )}
+
+          {/* Arrow */}
+          {upstreamFqns.length > 0 && (
+            <div className="flex items-center self-center mt-8">
+              <div className="w-8 border-t-2 border-gray-300" />
+              <svg className="w-3 h-3 text-gray-300 -ml-0.5" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="0,0 24,12 0,24" />
+              </svg>
+            </div>
+          )}
+
+          {/* Current table */}
+          <div className="flex flex-col items-center self-center mt-8">
+            <LineageNode
+              label={item.asset}
+              sublabel={item.dataset_id}
+              variant="current"
+            />
+          </div>
+
+          {/* Arrow */}
+          {downstreamFqns.length > 0 && (
+            <div className="flex items-center self-center mt-8">
+              <div className="w-8 border-t-2 border-gray-300" />
+              <svg className="w-3 h-3 text-gray-300 -ml-0.5" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="0,0 24,12 0,24" />
+              </svg>
+            </div>
+          )}
+
+          {/* Downstream column */}
+          {downstreamFqns.length > 0 && (
+            <div className="flex flex-col items-center gap-2 pt-8">
+              <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Downstream</p>
+              {downstreamFqns.map((e, i) => (
+                <LineageNode
+                  key={i}
+                  label={parseFqn(e.target_fqn)}
+                  sublabel={e.confidence}
+                  variant="downstream"
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {colLineageCount > 0 && (
+        <p className="text-center text-xs text-gray-400 mt-2">
+          + {colLineageCount} column-level edges — click columns in the Columns tab to inspect
+        </p>
+      )}
+
+      <p className="text-center text-[10px] text-gray-300 mt-4">
+        — HIGH confidence &nbsp; - - - MEDIUM &nbsp; Click upstream/downstream nodes to navigate
+      </p>
+    </div>
+  );
+}
+
+// ── SQL Tab ────────────────────────────────────────────────────────────────
+
+function SqlTab({ item }: { item: CatalogItem }) {
+  const topCols = item.columns.slice(0, 6);
+  const remaining = item.columns.length - topCols.length;
+  const colLines = topCols.map((c) => `  ${c.name}`).join(",\n");
+  const sql = `SELECT\n${colLines}${remaining > 0 ? `,\n  -- ... and ${remaining} more columns` : ""}\nFROM \`${item.project_id}.${item.dataset_id}.${item.asset}\`\nLIMIT 100;`;
+
+  return (
+    <div>
+      <p className="text-xs text-gray-400 uppercase tracking-wider mb-3">Sample Query</p>
+      <pre className="bg-gray-50 border border-gray-200 rounded-xl p-4 text-xs font-mono text-gray-800 overflow-x-auto whitespace-pre">
+        {sql}
+      </pre>
+    </div>
   );
 }
 
@@ -174,10 +487,49 @@ function CatalogCard({ item, onClick }: { item: CatalogItem; onClick: () => void
 
 type DetailTab = "columns" | "lineage" | "sql";
 
-function CardDetailModal({ item, onClose }: { item: CatalogItem; onClose: () => void }) {
+function CardDetailModal({
+  item,
+  registryDataset,
+  onClose,
+}: {
+  item: CatalogItem;
+  registryDataset: string;
+  onClose: () => void;
+}) {
   const [tab, setTab] = useState<DetailTab>("columns");
+  const [liveStats, setLiveStats] = useState<{ row_count: number | null; size_bytes: number | null } | null>(null);
+  const [lineageEdges, setLineageEdges] = useState<LineageEdge[]>([]);
+  const [lineageLoading, setLineageLoading] = useState(true);
+
+  useEffect(() => {
+    // Fetch live row count + size from BQ Table API
+    fetch(
+      `/api/marketplace/table-info?project_id=${encodeURIComponent(item.project_id)}&dataset_id=${encodeURIComponent(item.dataset_id)}&asset=${encodeURIComponent(item.asset)}`
+    )
+      .then((r) => r.json())
+      .then((d) => setLiveStats(d))
+      .catch(() => setLiveStats(null));
+
+    // Fetch lineage edges
+    setLineageLoading(true);
+    fetch(
+      `/api/marketplace/lineage?project_id=${encodeURIComponent(item.project_id)}&registry_dataset=${encodeURIComponent(registryDataset)}&asset=${encodeURIComponent(item.asset)}`
+    )
+      .then((r) => r.json())
+      .then((d) => {
+        setLineageEdges(d.edges ?? []);
+        setLineageLoading(false);
+      })
+      .catch(() => {
+        setLineageEdges([]);
+        setLineageLoading(false);
+      });
+  }, [item.project_id, item.dataset_id, item.asset, registryDataset]);
+
   const meta = item.table_metadata;
   const labels = meta.labels || {};
+  const rowCount = liveStats?.row_count ?? meta.row_count;
+  const sizeBytes = liveStats?.size_bytes ?? meta.size_bytes;
 
   return (
     <div className="fixed inset-0 z-50 flex" onClick={onClose}>
@@ -209,8 +561,8 @@ function CardDetailModal({ item, onClose }: { item: CatalogItem; onClose: () => 
         <div className="grid grid-cols-4 border-b border-gray-100 divide-x divide-gray-100 shrink-0">
           {([
             ["COLUMNS", item.columns.length],
-            ["ROWS", meta.row_count != null ? meta.row_count.toLocaleString() : "—"],
-            ["SIZE", formatSize(meta.size_bytes)],
+            ["ROWS", rowCount != null ? Number(rowCount).toLocaleString() : "—"],
+            ["SIZE", formatSize(sizeBytes)],
             ["VERSION", "v1"],
           ] as [string, string | number][]).map(([label, value]) => (
             <div key={label} className="p-4 text-center">
@@ -272,115 +624,15 @@ function CardDetailModal({ item, onClose }: { item: CatalogItem; onClose: () => 
 
         {/* Tab content */}
         <div className="flex-1 overflow-y-auto p-6">
-          {tab === "columns" && <ColumnsTab columns={item.columns} />}
-          {tab === "lineage" && <LineageTab item={item} />}
+          {tab === "columns" && (
+            <ColumnsTab columns={item.columns} lineageEdges={lineageEdges} />
+          )}
+          {tab === "lineage" && (
+            <LineageTab item={item} edges={lineageEdges} loading={lineageLoading} />
+          )}
           {tab === "sql" && <SqlTab item={item} />}
         </div>
       </div>
-    </div>
-  );
-}
-
-function ColumnsTab({ columns }: { columns: ColumnRecord[] }) {
-  return (
-    <div>
-      <p className="text-xs text-gray-400 uppercase tracking-wider mb-4">
-        {columns.length} columns — click to inspect
-      </p>
-      <div className="space-y-1">
-        {columns.map((col) => (
-          <div key={col.name} className="flex items-start gap-3 p-3 rounded-lg hover:bg-gray-50 cursor-default">
-            <span className="text-gray-300 font-mono text-sm mt-0.5 shrink-0">#</span>
-            <div className="flex-1 min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-medium text-gray-900">{col.name}</span>
-                <span className="text-xs text-gray-400 font-mono">{col.data_type}</span>
-                {col.is_pii && (
-                  <span className="text-[10px] bg-orange-50 text-orange-500 border border-orange-200 px-1.5 py-0.5 rounded font-medium">
-                    PII
-                  </span>
-                )}
-              </div>
-              {col.description && (
-                <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">{col.description}</p>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function LineageTab({ item }: { item: CatalogItem }) {
-  const { upstream, downstream } = item.lineage;
-
-  if (upstream === 0 && downstream === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center py-16 text-gray-400">
-        <svg className="w-12 h-12 mb-3 opacity-25" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-          <circle cx="6" cy="12" r="3" />
-          <circle cx="18" cy="6" r="3" />
-          <circle cx="18" cy="18" r="3" />
-          <line x1="9" y1="11" x2="15" y2="7" />
-          <line x1="9" y1="13" x2="15" y2="17" />
-        </svg>
-        <p className="text-sm font-medium mb-1">No lineage data available</p>
-        <p className="text-xs text-gray-400">Run the lineage fetcher to populate this view</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex items-center justify-center gap-10 py-10">
-      {upstream > 0 && (
-        <div className="flex flex-col items-center gap-2">
-          <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Upstream</p>
-          {Array.from({ length: upstream }).map((_, i) => (
-            <div key={i} className="bg-gray-100 rounded-lg px-4 py-2 text-xs text-gray-600 text-center min-w-[120px]">
-              Source {i + 1}
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div className="flex flex-col items-center gap-1">
-        <div className="bg-blue-500 text-white rounded-lg px-5 py-3 font-semibold text-sm text-center min-w-[140px]">
-          {item.asset}
-        </div>
-        <p className="text-[10px] text-blue-400">{item.dataset_id}</p>
-      </div>
-
-      {downstream > 0 && (
-        <div className="flex flex-col items-center gap-2">
-          <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Downstream</p>
-          {Array.from({ length: downstream }).map((_, i) => (
-            <div key={i} className="bg-gray-100 rounded-lg px-4 py-2 text-xs text-gray-600 text-center min-w-[120px]">
-              Target {i + 1}
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div className="mt-6 col-span-full text-center text-[10px] text-gray-400 absolute bottom-4">
-        — HIGH confidence&nbsp;&nbsp;- - - MEDIUM
-      </div>
-    </div>
-  );
-}
-
-function SqlTab({ item }: { item: CatalogItem }) {
-  const topCols = item.columns.slice(0, 6);
-  const remaining = item.columns.length - topCols.length;
-  const colLines = topCols.map((c) => `  ${c.name}`).join(",\n");
-  const sql = `SELECT\n${colLines}${remaining > 0 ? `,\n  -- ... and ${remaining} more columns` : ""}\nFROM \`${item.project_id}.${item.dataset_id}.${item.asset}\`\nLIMIT 100;`;
-
-  return (
-    <div>
-      <p className="text-xs text-gray-400 uppercase tracking-wider mb-3">Sample Query</p>
-      <pre className="bg-gray-50 border border-gray-200 rounded-xl p-4 text-xs font-mono text-gray-800 overflow-x-auto whitespace-pre">
-        {sql}
-      </pre>
     </div>
   );
 }
@@ -401,10 +653,7 @@ function MarketplaceMainView({
   const [domainFilter, setDomainFilter] = useState("ALL");
   const [selectedItem, setSelectedItem] = useState<CatalogItem | null>(null);
 
-  const datasets = [
-    "ALL",
-    ...Array.from(new Set(data.catalog.map((i) => i.dataset_id))).sort(),
-  ];
+  const datasets = ["ALL", ...Array.from(new Set(data.catalog.map((i) => i.dataset_id))).sort()];
   const domains = [
     "ALL",
     ...Array.from(
@@ -534,9 +783,7 @@ function MarketplaceMainView({
           className="px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-200 bg-white text-gray-700"
         >
           {datasets.map((d) => (
-            <option key={d} value={d}>
-              Dataset: {d}
-            </option>
+            <option key={d} value={d}>Dataset: {d}</option>
           ))}
         </select>
         <select
@@ -545,9 +792,7 @@ function MarketplaceMainView({
           className="px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-200 bg-white text-gray-700"
         >
           {domains.map((d) => (
-            <option key={d} value={d}>
-              Domain: {d}
-            </option>
+            <option key={d} value={d}>Domain: {d}</option>
           ))}
         </select>
         <span className="ml-auto text-xs text-gray-400">
@@ -576,7 +821,11 @@ function MarketplaceMainView({
       </div>
 
       {selectedItem && (
-        <CardDetailModal item={selectedItem} onClose={() => setSelectedItem(null)} />
+        <CardDetailModal
+          item={selectedItem}
+          registryDataset={data.registry_dataset}
+          onClose={() => setSelectedItem(null)}
+        />
       )}
     </div>
   );
@@ -638,7 +887,6 @@ export default function MarketplacePage({ projectId, onBack }: MarketplacePagePr
             if (!part.startsWith("data: ")) continue;
             try {
               const event = JSON.parse(part.slice(6));
-
               if (event.type === "step") {
                 setSteps((prev) => {
                   const next = [...prev];
@@ -674,9 +922,7 @@ export default function MarketplacePage({ projectId, onBack }: MarketplacePagePr
     return () => abortRef.current?.abort();
   }, [runInit]);
 
-  if (phase === "init") {
-    return <InitScreen steps={steps} />;
-  }
+  if (phase === "init") return <InitScreen steps={steps} />;
 
   if (phase === "error") {
     return (
@@ -692,16 +938,10 @@ export default function MarketplacePage({ projectId, onBack }: MarketplacePagePr
           <h2 className="text-base font-semibold text-gray-900 mb-2">Initialization Failed</h2>
           <p className="text-sm text-gray-500 mb-6 leading-relaxed">{error}</p>
           <div className="flex gap-3 justify-center">
-            <button
-              onClick={onBack}
-              className="px-5 py-2 text-sm text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
-            >
+            <button onClick={onBack} className="px-5 py-2 text-sm text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
               Back
             </button>
-            <button
-              onClick={runInit}
-              className="px-5 py-2 text-sm text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors"
-            >
+            <button onClick={runInit} className="px-5 py-2 text-sm text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">
               Retry
             </button>
           </div>
@@ -710,11 +950,5 @@ export default function MarketplacePage({ projectId, onBack }: MarketplacePagePr
     );
   }
 
-  return (
-    <MarketplaceMainView
-      data={data!}
-      onBack={onBack}
-      onRecrawl={runInit}
-    />
-  );
+  return <MarketplaceMainView data={data!} onBack={onBack} onRecrawl={runInit} />;
 }

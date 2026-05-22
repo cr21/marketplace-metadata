@@ -11,6 +11,7 @@ import structlog
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from google.cloud import bigquery as _bq
 from pydantic import BaseModel
 
 from catalog_agent.bq.client import get_bq_client
@@ -561,6 +562,77 @@ async def update_catalog(req: UpdateCatalogRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Marketplace — live table stats
+# ---------------------------------------------------------------------------
+
+@app.get("/api/marketplace/table-info")
+def get_table_info(
+    project_id: str = Query(...),
+    dataset_id: str = Query(...),
+    asset: str = Query(...),
+) -> dict[str, Any]:
+    """Return live row_count and size_bytes from the BigQuery Table resource API."""
+    settings = get_settings()
+    client = get_bq_client(settings)
+    try:
+        tbl = client.get_table(f"{project_id}.{dataset_id}.{asset}")
+        return {"row_count": tbl.num_rows, "size_bytes": tbl.num_bytes}
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Marketplace — lineage for a single asset
+# ---------------------------------------------------------------------------
+
+@app.get("/api/marketplace/lineage")
+def get_asset_lineage(
+    project_id: str = Query(...),
+    registry_dataset: str = Query(...),
+    asset: str = Query(...),
+) -> dict[str, Any]:
+    """Return all lineage edges for the given asset from lineage_registry.
+
+    Returns an empty edge list (not a 404) when lineage_registry doesn't exist
+    or the asset has no recorded edges — the UI handles that gracefully.
+    """
+    settings = get_settings()
+    client = get_bq_client(settings)
+    try:
+        sql = f"""
+        SELECT
+            direction,
+            source_fqn,
+            target_fqn,
+            source_column,
+            target_column,
+            confidence
+        FROM `{project_id}.{registry_dataset}.lineage_registry`
+        WHERE asset = @asset
+        ORDER BY direction, confidence DESC
+        """
+        job_config = _bq.QueryJobConfig(
+            query_parameters=[_bq.ScalarQueryParameter("asset", "STRING", asset)]
+        )
+        rows = list(client.query(sql, job_config=job_config).result())
+        return {
+            "edges": [
+                {
+                    "direction": r.direction,
+                    "source_fqn": r.source_fqn,
+                    "target_fqn": r.target_fqn,
+                    "source_column": r.source_column,
+                    "target_column": r.target_column,
+                    "confidence": r.confidence,
+                }
+                for r in rows
+            ]
+        }
+    except Exception:
+        return {"edges": []}
 
 
 # ---------------------------------------------------------------------------

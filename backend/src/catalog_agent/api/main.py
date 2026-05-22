@@ -438,6 +438,31 @@ def _do_update(req: UpdateCatalogRequest, emit: Callable[[dict[str, Any]], None]
         })
         return
 
+    # ── LLM enrichment for delta rows ────────────────────────────────────────
+    if settings.openai_api_key:
+        try:
+            from openai import OpenAI
+            from catalog_agent.catalog.llm_enricher import enrich_catalog_row
+
+            openai_client = OpenAI(api_key=settings.openai_api_key)
+            emit({"type": "status", "text": "Generating metadata with LLM…"})
+            enriched = []
+            for i, row in enumerate(delta_rows):
+                emit({
+                    "type": "activity",
+                    "text": f"Generating metadata for {row.dataset_id}.{row.asset}",
+                    "event_type": "info",
+                })
+                emit({"type": "progress", "step": "Generating metadata", "current": i, "total": len(delta_rows)})
+                enriched.append(enrich_catalog_row(row, openai_client, settings.openai_model))
+            delta_rows = enriched
+            emit({"type": "progress", "step": "Generating metadata", "current": len(delta_rows), "total": len(delta_rows)})
+            emit({"type": "activity", "text": "LLM enrichment complete", "event_type": "success"})
+        except Exception as e:
+            emit({"type": "activity", "text": f"LLM enrichment skipped: {e}", "event_type": "info"})
+    else:
+        emit({"type": "activity", "text": "LLM enrichment skipped (no OPENAI_API_KEY set)", "event_type": "info"})
+
     # ── Write delta rows ─────────────────────────────────────────────────────
     emit({"type": "status", "text": "Writing changes to BigQuery…"})
     emit({"type": "progress_write", "step": "Writing to BigQuery", "current": 0, "total": len(delta_rows)})

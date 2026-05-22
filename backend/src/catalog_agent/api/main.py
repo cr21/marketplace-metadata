@@ -41,6 +41,20 @@ app.add_middleware(
 
 # main.py lives at backend/src/catalog_agent/api/main.py → parents[4] = project root
 _DDL_FILE = Path(__file__).parents[4] / "infra" / "bq" / "data_catalog_registry.sql"
+_LINEAGE_DDL_FILE = Path(__file__).parents[4] / "infra" / "bq" / "lineage_registry.sql"
+
+
+def _lineage_registry_ddl(project: str, dataset: str) -> str:
+    """Return CREATE TABLE IF NOT EXISTS DDL for lineage_registry."""
+    raw = _LINEAGE_DDL_FILE.read_text()
+    body_lines = [l for l in raw.splitlines() if not l.strip().startswith("--")]
+    body = "\n".join(body_lines).strip().rstrip(";")
+    return re.sub(
+        r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`[^`]+`",
+        f"CREATE TABLE IF NOT EXISTS `{project}.{dataset}.lineage_registry`",
+        body,
+        flags=re.IGNORECASE,
+    )
 
 
 def _registry_ddl(project: str, dataset: str, table: str) -> str:
@@ -633,6 +647,139 @@ def get_asset_lineage(
         }
     except Exception:
         return {"edges": []}
+
+
+# ---------------------------------------------------------------------------
+# Marketplace — fetch lineage for all datasets (SSE streaming)
+# ---------------------------------------------------------------------------
+
+class FetchLineageRequest(BaseModel):
+    project_id: str
+    registry_dataset: str
+
+
+def _do_fetch_lineage(req: FetchLineageRequest, emit: Callable[[dict[str, Any]], None]) -> None:
+    """Fetch lineage for every asset in data_catalog_registry and write to lineage_registry."""
+    import asyncio as _asyncio
+
+    from catalog_agent.lineage.client import LineageApiClient
+    from catalog_agent.lineage.fetcher import fetch_lineage_for_dataset
+    from catalog_agent.lineage.writer import merge_lineage_edges
+
+    settings = get_settings()
+    client = get_bq_client(settings)
+
+    # Ensure lineage_registry table exists
+    emit({"type": "setup", "status": "in_progress", "text": "Ensuring lineage_registry table exists"})
+    ddl = _lineage_registry_ddl(req.project_id, req.registry_dataset)
+    client.query(ddl).result()
+    emit({"type": "setup", "status": "done", "text": "lineage_registry table ready"})
+
+    # Read all non-routine assets grouped by dataset
+    emit({"type": "setup", "status": "in_progress", "text": "Reading assets from catalog registry"})
+    sql = f"""
+    SELECT dataset_id, asset
+    FROM `{req.project_id}.{req.registry_dataset}.data_catalog_registry`
+    WHERE asset_type NOT IN ('ROUTINE')
+    ORDER BY dataset_id, asset
+    """
+    rows = list(client.query(sql).result())
+
+    datasets: dict[str, list[str]] = {}
+    for row in rows:
+        datasets.setdefault(row.dataset_id, []).append(row.asset)
+
+    total_assets = len(rows)
+    emit({
+        "type": "setup", "status": "done",
+        "text": f"Found {total_assets} assets across {len(datasets)} dataset(s)",
+    })
+
+    # Initialise lineage API client
+    lineage_client = LineageApiClient(req.project_id, location=settings.lineage_location)
+    total_edges = 0
+
+    for i, (dataset_id, assets) in enumerate(datasets.items()):
+        emit({
+            "type": "dataset_start",
+            "dataset": dataset_id,
+            "index": i + 1,
+            "total": len(datasets),
+            "text": f"Fetching lineage for {dataset_id} ({len(assets)} assets)…",
+        })
+        try:
+            report = _asyncio.run(
+                fetch_lineage_for_dataset(
+                    lineage_client=lineage_client,
+                    bq_client=client,
+                    project_id=req.project_id,
+                    dataset_id=dataset_id,
+                    assets=assets,
+                    settings=settings,
+                )
+            )
+            if report.edges:
+                merge_lineage_edges(
+                    client=client,
+                    edges=report.edges,
+                    catalog_project_id=req.project_id,
+                    catalog_dataset_id=req.registry_dataset,
+                )
+            total_edges += len(report.edges)
+            emit({
+                "type": "dataset_done",
+                "dataset": dataset_id,
+                "index": i + 1,
+                "total": len(datasets),
+                "edge_count": len(report.edges),
+                "text": f"{dataset_id}: {report.summary()}",
+            })
+        except Exception as exc:
+            emit({
+                "type": "dataset_error",
+                "dataset": dataset_id,
+                "index": i + 1,
+                "total": len(datasets),
+                "text": f"{dataset_id}: {exc}",
+            })
+
+    emit({"type": "done", "total_edges": total_edges,
+          "text": f"Complete — {total_edges} lineage edge(s) written to {req.registry_dataset}.lineage_registry"})
+
+
+@app.post("/api/marketplace/fetch-lineage")
+async def fetch_lineage_endpoint(req: FetchLineageRequest) -> StreamingResponse:
+    """Fetch lineage for every catalogued asset and stream progress as SSE."""
+
+    async def event_stream() -> Any:
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def emit(event: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        def worker() -> None:
+            try:
+                _do_fetch_lineage(req, emit)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "text": str(exc)})
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield _sse(event)
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------------------------------------------------------------------------
